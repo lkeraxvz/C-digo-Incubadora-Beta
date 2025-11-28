@@ -1,0 +1,402 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <DHT.h>
+#include <U8g2lib.h>
+#include <time.h>
+
+// ===== CONFIG =====
+const char* ssid = "INFINITUM95FC_2.4";
+const char* password = "f6GA6FTasC";
+
+// Host
+const char* host = "thermotactic-deutoplasmic-merrie.ngrok-free.dev";
+
+// Endpoints
+const char* endpointComponentes = "/componentes";
+const char* endpointRegistroSensores = "/api/registro/sensores";
+
+// DHT
+#define DHTPIN1 14
+#define DHTPIN2 27
+#define DHTTYPE DHT11
+DHT dhtA(DHTPIN1, DHTTYPE);
+DHT dhtB(DHTPIN2, DHTTYPE);
+
+// Relés (ACTIVOS EN LOW)
+#define RELAY_VENTILADOR 23
+#define RELAY_HUMIDIFICADOR 21
+#define RELAY_SENSOR1 4
+#define RELAY_SENSOR2 5
+#define RELAY_CALETOR 2 // Si no lo usas, ignora o desconecta
+
+// LEDs indicadores
+#define LED_VERDE_VENT 32
+#define LED_ROJO_VENT 33
+#define LED_VERDE_HUM 25
+#define LED_ROJO_HUM 26
+
+// OLED (HW I2C constructor correcto)
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R2, U8X8_PIN_NONE);
+
+// Intervals
+const unsigned long INTERVALO_ESTADO = 5000UL;   // 5 s - consultar /componentes
+const unsigned long INTERVALO_LECTURA = 180000UL; // 3 min - leer DHT y actualizar pantalla
+const unsigned long INTERVALO_ENVIO = 3600000UL;  // 1 h - enviar datos
+
+unsigned long lastEstado = 0;
+unsigned long lastLectura = 0;
+unsigned long lastEnvio = 0;
+
+// Datos sensores
+float tempA = NAN, humA = NAN;
+float tempB = NAN, humB = NAN;
+
+// Estados actuadores segun API
+bool estadoVentilador = false;
+bool estadoHumidificador = false;
+bool estadoSensor1 = false;
+bool estadoSensor2 = false;
+bool estadoCalefactor = false; // opcional
+
+// Flags
+bool sensoresActivos = false;
+bool pantallaActualizada = false;
+
+// ---------- Helpers ----------
+
+String buildHttpsUrl(const char* host, const char* endpoint) {
+  String url = String("https://") + host + String(endpoint);
+  return url;
+}
+
+float readValidDHT(DHT &sensor, bool isTemp) {
+  float sum = 0;
+  int count = 0;
+  for (int i = 0; i < 8; ++i) { // menos iteraciones para no bloquear mucho
+    float v = isTemp ? sensor.readTemperature() : sensor.readHumidity();
+    if (!isnan(v) && (isTemp ? (v > -40 && v < 80) : (v >= 0 && v <= 100))) {
+      sum += v;
+      count++;
+    }
+    delay(60);
+  }
+  return (count > 0) ? (sum / count) : NAN;
+}
+
+void aplicarEstadosActuadoresEnHardware() {
+  // Relés activos LOW
+  digitalWrite(RELAY_VENTILADOR, estadoVentilador ? LOW : HIGH);
+  digitalWrite(RELAY_HUMIDIFICADOR, estadoHumidificador ? LOW : HIGH);
+  digitalWrite(RELAY_SENSOR1, estadoSensor1 ? LOW : HIGH);
+  digitalWrite(RELAY_SENSOR2, estadoSensor2 ? LOW : HIGH);
+  digitalWrite(RELAY_CALETOR, estadoCalefactor ? LOW : HIGH);
+
+  // LEDs
+  digitalWrite(LED_VERDE_VENT, estadoVentilador ? HIGH : LOW);
+  digitalWrite(LED_ROJO_VENT, estadoVentilador ? LOW : HIGH);
+
+  digitalWrite(LED_VERDE_HUM, estadoHumidificador ? HIGH : LOW);
+  digitalWrite(LED_ROJO_HUM, estadoHumidificador ? LOW : HIGH);
+}
+
+// ---------- I/O pantalla ----------
+void actualizarPantalla() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x13_tf);
+
+  u8g2.setCursor(0, 10);
+  u8g2.print("S1: "); u8g2.print(estadoSensor1 ? "ON " : "OFF");
+  u8g2.setCursor(64, 10);
+  u8g2.print("S2: "); u8g2.print(estadoSensor2 ? "ON " : "OFF");
+
+  u8g2.setCursor(0, 26);
+  u8g2.print("V: "); u8g2.print(estadoVentilador ? "ON " : "OFF");
+  u8g2.setCursor(64, 26);
+  u8g2.print("H: "); u8g2.print(estadoHumidificador ? "ON " : "OFF");
+
+  if (sensoresActivos) {
+    u8g2.setCursor(0, 44);
+    if (!isnan(tempA)) u8g2.printf("T1: %.1fC", tempA); else u8g2.print("T1: --.-C");
+    u8g2.setCursor(0, 60);
+    if (!isnan(humA))  u8g2.printf("H1: %.0f%%", humA);  else u8g2.print("H1: ---%");
+  } else {
+    u8g2.setCursor(0, 44);
+    u8g2.print("Sensores no activos");
+  }
+
+  u8g2.sendBuffer();
+}
+
+// ---------- Lectura sensores ----------
+void leerSensores() {
+  Serial.println("[SENSORES] Iniciando lectura...");
+
+  if (!estadoSensor1 && !estadoSensor2) {
+    Serial.println("[SENSORES] Ambos sensores desactivados por API.");
+    sensoresActivos = false;
+    tempA = humA = tempB = humB = NAN;
+    return;
+  }
+
+  // Activar solo relés necesarios (activo = LOW)
+  digitalWrite(RELAY_SENSOR1, estadoSensor1 ? LOW : HIGH);
+  digitalWrite(RELAY_SENSOR2, estadoSensor2 ? LOW : HIGH);
+  delay(2000); // estabilización
+
+  if (estadoSensor1) {
+    tempA = readValidDHT(dhtA, true);
+    humA  = readValidDHT(dhtA, false);
+  } else {
+    tempA = humA = NAN;
+  }
+
+  if (estadoSensor2) {
+    tempB = readValidDHT(dhtB, true);
+    humB  = readValidDHT(dhtB, false);
+  } else {
+    tempB = humB = NAN;
+  }
+
+  bool err1 = estadoSensor1 && (isnan(tempA) || isnan(humA));
+  bool err2 = estadoSensor2 && (isnan(tempB) || isnan(humB));
+
+  if (err1 || err2) {
+    Serial.println("[SENSORES] Error leyendo sensores activos. Revisa conexiones.");
+    sensoresActivos = false;
+  } else {
+    sensoresActivos = true;
+    Serial.printf("[SENSORES] T1: %.1f H1: %.1f | T2: %.1f H2: %.1f\n", 
+                  (isnan(tempA)?0:tempA), (isnan(humA)?0:humA), (isnan(tempB)?0:tempB), (isnan(humB)?0:humB));
+  }
+}
+
+// ---------- Envío POST ----------
+void enviarDatosRegistro() {
+  if (!sensoresActivos || WiFi.status() != WL_CONNECTED) {
+    Serial.println("[POST] No se enviarán datos: sensores inactivos o WiFi no conectado.");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure(); // ngrok self-signed
+
+  HTTPClient http;
+  String url = buildHttpsUrl(host, endpointRegistroSensores);
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+
+  // Fecha ISO en UTC
+  char fechaIso[30];
+  time_t now = time(nullptr);
+  struct tm *tm_utc = gmtime(&now);
+  strftime(fechaIso, sizeof(fechaIso), "%Y-%m-%dT%H:%M:%S.000Z", tm_utc);
+
+  StaticJsonDocument<256> doc;
+  doc["fecha"] = String(fechaIso);
+  doc["temperatura1"] = isnan(tempA) ? 0 : tempA;
+  doc["humedad1"] = isnan(humA) ? 0 : humA;
+  doc["temperatura2"] = isnan(tempB) ? 0 : tempB;
+  doc["humedad2"] = isnan(humB) ? 0 : humB;
+
+  String payload;
+  serializeJson(doc, payload);
+  Serial.println("[POST] Enviando payload:");
+  Serial.println(payload);
+
+  int httpCode = http.POST(payload);
+  Serial.print("[POST] Código: ");
+  Serial.println(httpCode);
+
+  if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
+    String resp = http.getString();
+    Serial.println("[POST] Respuesta:");
+    Serial.println(resp);
+  } else {
+    Serial.println("[POST] Error al enviar datos");
+  }
+
+  http.end();
+}
+
+// ---------- Obtener estados desde /componentes ----------
+void obtenerEstadosDesdeAPI() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[GET] WiFi no conectado");
+    return;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+
+  String url = buildHttpsUrl(host, endpointComponentes);
+  http.begin(client, url);
+
+  int httpCode = http.GET();
+  Serial.print("[GET] Código: "); Serial.println(httpCode);
+
+  if (httpCode != 200) {
+    Serial.println("[GET] Error al obtener estado de actuadores. Código: " + String(httpCode));
+    http.end();
+    return;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  Serial.println("[GET] JSON recibido:");
+  Serial.println(payload);
+
+  // Parsear array de componentes
+  DynamicJsonDocument doc(4096);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.print("[GET] Error parseando JSON: ");
+    Serial.println(err.c_str());
+    return;
+  }
+
+  // Resetear estados antes de reasignar
+  bool prevVent = estadoVentilador;
+  bool prevHum  = estadoHumidificador;
+  bool prevS1   = estadoSensor1;
+  bool prevS2   = estadoSensor2;
+  bool prevCal  = estadoCalefactor;
+
+  // doc es un array de objetos
+  if (doc.is<JsonArray>()) {
+    for (JsonObject obj : doc.as<JsonArray>()) {
+      const char* nombre = obj["nombreComponente"] | obj["nombre"]; // intenta ambas claves
+      bool estado = obj["estado"] | false;
+      if (!nombre) continue;
+      String s = String(nombre);
+      s.toLowerCase();
+
+      // Reglas de mapeo:
+      if (s.indexOf("sensor") >= 0 && s.indexOf("a") >= 0) {
+        estadoSensor1 = estado;
+      } else if (s.indexOf("sensor") >= 0 && s.indexOf("b") >= 0) {
+        estadoSensor2 = estado;
+      } else if (s.indexOf("vent") >= 0) {
+        estadoVentilador = estado;
+      } else if (s.indexOf("hum") >= 0) {
+        estadoHumidificador = estado;
+      } else if (s.indexOf("cal") >= 0) {
+        estadoCalefactor = estado;
+      } // otros componentes pueden ignorarse
+    }
+  } else {
+    Serial.println("[GET] formato inesperado (no es array).");
+  }
+
+  // Si algo cambió, aplicarlo en hardware
+  if (estadoVentilador != prevVent || estadoHumidificador != prevHum ||
+      estadoSensor1 != prevS1 || estadoSensor2 != prevS2 || estadoCalefactor != prevCal) {
+    aplicarEstadosActuadoresEnHardware();
+    Serial.printf("[GET] Estados aplicados: V:%d H:%d S1:%d S2:%d Cal:%d\n",
+                  estadoVentilador, estadoHumidificador, estadoSensor1, estadoSensor2, estadoCalefactor);
+
+    // Si se activó alguno de los sensores, forzar lectura inmediata
+    if ((estadoSensor1 && !prevS1) || (estadoSensor2 && !prevS2)) {
+      leerSensores();
+      pantallaActualizada = false;
+    }
+  }
+}
+
+// ---------- Setup & Loop ----------
+
+void setup() {
+  Serial.begin(115200);
+
+  // I2C hardware (SDA=19, SCL=18)
+  Wire.begin(19, 18);
+  Wire.setClock(400000);
+
+  // Pines relés y LEDs
+  pinMode(RELAY_VENTILADOR, OUTPUT);
+  pinMode(RELAY_HUMIDIFICADOR, OUTPUT);
+  pinMode(RELAY_SENSOR1, OUTPUT);
+  pinMode(RELAY_SENSOR2, OUTPUT);
+  pinMode(RELAY_CALETOR, OUTPUT);
+
+  pinMode(LED_VERDE_VENT, OUTPUT);
+  pinMode(LED_ROJO_VENT, OUTPUT);
+  pinMode(LED_VERDE_HUM, OUTPUT);
+  pinMode(LED_ROJO_HUM, OUTPUT);
+
+  // Relés apagados por defecto (HIGH)
+  digitalWrite(RELAY_VENTILADOR, HIGH);
+  digitalWrite(RELAY_HUMIDIFICADOR, HIGH);
+  digitalWrite(RELAY_SENSOR1, HIGH);
+  digitalWrite(RELAY_SENSOR2, HIGH);
+  digitalWrite(RELAY_CALETOR, HIGH);
+
+  // LEDs iniciales
+  digitalWrite(LED_VERDE_VENT, LOW);
+  digitalWrite(LED_ROJO_VENT, HIGH);
+  digitalWrite(LED_VERDE_HUM, LOW);
+  digitalWrite(LED_ROJO_HUM, HIGH);
+
+  // Sensores
+  dhtA.begin();
+  dhtB.begin();
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("[WIFI] Conectando");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print(".");
+  }
+  Serial.println("\n[WIFI] Conectado");
+
+  // OLED
+  u8g2.begin();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+
+  // Primera sincronización con servidor
+  obtenerEstadosDesdeAPI();
+  leerSensores();
+  actualizarPantalla();
+  enviarDatosRegistro();
+
+  lastEstado = millis();
+  lastLectura = millis();
+  lastEnvio = millis();
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // Consultar estados cada INTERVALO_ESTADO
+  if (now - lastEstado >= INTERVALO_ESTADO) {
+    obtenerEstadosDesdeAPI();
+    lastEstado = now;
+  }
+
+  // Leer sensores cada INTERVALO_LECTURA
+  if (now - lastLectura >= INTERVALO_LECTURA) {
+    leerSensores();
+    pantallaActualizada = false;
+    lastLectura = now;
+  }
+
+  // Actualizar pantalla (después de lectura)
+  if (!pantallaActualizada && (now - lastLectura < INTERVALO_LECTURA)) {
+    actualizarPantalla();
+    pantallaActualizada = true;
+  }
+
+  // Enviar datos cada INTERVALO_ENVIO
+  if (now - lastEnvio >= INTERVALO_ENVIO) {
+    enviarDatosRegistro();
+    lastEnvio = now;
+  }
+
+  // pequeño delay para no llenar CPU
+  delay(20);
+}
