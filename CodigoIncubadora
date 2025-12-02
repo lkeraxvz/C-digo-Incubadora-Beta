@@ -8,8 +8,8 @@
 #include <time.h>
 
 // ===== CONFIG =====
-const char* ssid = "INFINITUM95FC_2.4";
-const char* password = "f6GA6FTasC";
+const char* ssid = "CONNECTION";
+const char* password = "PASSWORD";
 
 // Host
 const char* host = "thermotactic-deutoplasmic-merrie.ngrok-free.dev";
